@@ -771,23 +771,39 @@ export default function BrainTumorDashboard() {
       return;
     }
 
-    // ── Step 3: Send to /segment, decode real results ──
+    // ── Step 3: POST file → get job_id immediately, then poll for result ──
     try {
-      addLog("Uploading MRI for segmentation (may take 30–120s on CPU)...");
+      addLog("Uploading MRI to backend...");
       const t0 = performance.now();
       const fd = new FormData();
       fd.append("file", file);
 
-      const res = await fetch(`${url}/segment`, {
+      // POST returns instantly with a job_id (avoids ngrok 30s timeout)
+      const startRes = await fetch(`${url}/segment`, {
         method: "POST",
         body: fd,
         headers: NGROK_HEADERS,
       });
-      if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(`HTTP ${res.status}: ${txt}`);
+      if (!startRes.ok) {
+        const txt = await startRes.text();
+        throw new Error(`Upload failed HTTP ${startRes.status}: ${txt}`);
       }
-      const json = await res.json();
+      const { job_id } = await startRes.json();
+      addLog(`Job started: ${job_id} — polling for result...`);
+
+      // Poll every 4 seconds until done
+      let json = null;
+      let attempts = 0;
+      while (attempts < 60) {  // max 4 minutes
+        await new Promise(r => setTimeout(r, 4000));
+        attempts++;
+        const pollRes = await fetch(`${url}/segment/${job_id}`, { headers: NGROK_HEADERS });
+        const poll = await pollRes.json();
+        if (poll.status === "done")    { json = poll; break; }
+        if (poll.status === "error")   { throw new Error(`Backend error: ${poll.detail}`); }
+        addLog(`Processing... ${poll.status} (${attempts * 4}s elapsed)`);
+      }
+      if (!json) throw new Error("Timed out waiting for result after 4 minutes");
       const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
       addLog(`✅ Segmentation complete in ${elapsed}s on ${json.device_used}`);
 

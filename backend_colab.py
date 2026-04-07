@@ -14,10 +14,11 @@ Pretrained model: MONAI Model Zoo 'brats_mri_segmentation'
 
 import io
 import os
+import uuid
 import base64
 import tempfile
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+import threading
 import numpy as np
 import torch
 import nibabel as nib
@@ -28,8 +29,8 @@ from monai.networks.nets import SegResNet
 import uvicorn
 from pyngrok import ngrok
 
-# Thread pool so CPU inference doesn't block the asyncio event loop
-_executor = ThreadPoolExecutor(max_workers=1)
+# In-memory job store  {job_id: {"status": "queued"|"running"|"done"|"error", ...}}
+JOBS: dict = {}
 
 # ============================================================================
 # Configuration
@@ -231,7 +232,7 @@ def preprocess_nifti(nifti_data):
     if channels.shape[1:] != MODEL_INPUT_SIZE:
         from scipy.ndimage import zoom
         zoom_factors = [1.0] + [MODEL_INPUT_SIZE[i] / channels.shape[i + 1] for i in range(3)]
-        channels = zoom(channels, zoom_factors, order=1).astype(np.float32)
+        channels = zoom(channels, zoom_factors, order=0).astype(np.float32)  # order=0 = nearest, 5x faster
 
     tensor = torch.from_numpy(channels).float().unsqueeze(0)  # (1, 4, 128, 128, 128)
     return tensor.to(DEVICE)
@@ -250,64 +251,74 @@ async def health():
     })
 
 
+def _run_inference_job(job_id: str, file_bytes: bytes, fname: str):
+    """Runs in a background thread. Updates JOBS[job_id] when done."""
+    try:
+        JOBS[job_id]["status"] = "running"
+
+        suffix = ".nii.gz" if fname.endswith(".nii.gz") else ".nii"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        try:
+            nifti_img  = nib.load(tmp_path)
+            nifti_data = nifti_img.get_fdata(dtype=np.float32)
+        finally:
+            os.unlink(tmp_path)
+
+        tensor = preprocess_nifti(nifti_data)
+
+        with torch.no_grad():
+            output = model(tensor)
+
+        seg = torch.argmax(output, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+        seg_b64 = base64.b64encode(seg.tobytes()).decode("utf-8")
+
+        JOBS[job_id] = {
+            "status":      "done",
+            "segmentation": seg_b64,
+            "shape":        list(seg.shape),
+            "classes":      int(NUM_CLASSES),
+            "device_used":  str(DEVICE),
+        }
+        print(f"[job {job_id}] done — shape {seg.shape}")
+
+    except Exception as e:
+        import traceback
+        print(f"[job {job_id}] ERROR:\n{traceback.format_exc()}")
+        JOBS[job_id] = {"status": "error", "detail": str(e)}
+
+
 @app.post("/segment")
 async def segment(file: UploadFile = File(...)):
     """
-    Accept NIFTI MRI file, return base64-encoded segmentation mask.
-    Input:  .nii or .nii.gz file (3D or 4D)
-    Output: { segmentation: base64, shape: [...], classes: 3, device_used: str }
+    Starts segmentation job. Returns job_id immediately (avoids ngrok 30s timeout).
+    Poll GET /segment/{job_id} for the result.
     """
     if not model_loaded:
         raise HTTPException(status_code=503, detail="Model not loaded.")
-
     if not (file.filename.endswith(".nii") or file.filename.endswith(".nii.gz")):
         raise HTTPException(status_code=400, detail="File must be .nii or .nii.gz")
 
-    try:
-        # Read file bytes in async context
-        file_bytes = await file.read()
-        fname = file.filename or "upload.nii"
+    file_bytes = await file.read()
+    fname      = file.filename or "upload.nii"
+    job_id     = uuid.uuid4().hex[:10]
 
-        # Run all CPU-heavy work in a thread so we don't block the event loop
-        def run_inference():
-            # Write to temp file (nibabel needs a real path for .nii.gz)
-            suffix = ".nii.gz" if fname.endswith(".nii.gz") else ".nii"
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                tmp.write(file_bytes)
-                tmp_path = tmp.name
+    JOBS[job_id] = {"status": "queued"}
+    thread = threading.Thread(target=_run_inference_job, args=(job_id, file_bytes, fname), daemon=True)
+    thread.start()
 
-            try:
-                nifti_img  = nib.load(tmp_path)
-                nifti_data = nifti_img.get_fdata(dtype=np.float32)
-            finally:
-                os.unlink(tmp_path)
+    print(f"[job {job_id}] queued — file={fname} size={len(file_bytes)//1024}KB")
+    return JSONResponse({"job_id": job_id, "status": "queued"})
 
-            tensor = preprocess_nifti(nifti_data)
 
-            with torch.no_grad():
-                output = model(tensor)
-
-            seg = torch.argmax(output, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
-            return seg
-
-        loop = asyncio.get_event_loop()
-        segmentation = await loop.run_in_executor(_executor, run_inference)
-
-        seg_b64 = base64.b64encode(segmentation.tobytes()).decode("utf-8")
-
-        return JSONResponse({
-            "segmentation": seg_b64,
-            "classes": int(NUM_CLASSES),
-            "shape": list(segmentation.shape),
-            "device_used": str(DEVICE),
-        })
-
-    except nib.filebasedimage.ImageFileError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid NIFTI file: {e}")
-    except Exception as e:
-        import traceback
-        print(f"Segment error:\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Segmentation failed: {e}")
+@app.get("/segment/{job_id}")
+async def poll_segment(job_id: str):
+    """Poll for segmentation result. Returns status + result when done."""
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return JSONResponse(JOBS[job_id])
 
 # ============================================================================
 # ngrok Tunnel
