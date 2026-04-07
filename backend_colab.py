@@ -22,6 +22,7 @@ import threading
 import numpy as np
 import torch
 import nibabel as nib
+from scipy.ndimage import zoom          # import at top — threading can't re-import C extensions
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -230,7 +231,6 @@ def preprocess_nifti(nifti_data):
 
     # Resize to 128³ if needed
     if channels.shape[1:] != MODEL_INPUT_SIZE:
-        from scipy.ndimage import zoom
         zoom_factors = [1.0] + [MODEL_INPUT_SIZE[i] / channels.shape[i + 1] for i in range(3)]
         channels = zoom(channels, zoom_factors, order=0).astype(np.float32)  # order=0 = nearest, 5x faster
 
