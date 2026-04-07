@@ -413,14 +413,12 @@ def setup_ngrok_tunnel():
 # Entry Point
 # ============================================================================
 
-def run_server():
-    """Run uvicorn server in a background thread (for Colab compatibility)."""
-    import sys
-
+def run_server_thread():
+    """Run entire server stack (ngrok + uvicorn) in background thread."""
     print(f"Device : {DEVICE}")
     print(f"Model  : {'loaded' if model_loaded else 'FAILED'}")
 
-    # ── Start ngrok BEFORE uvicorn so the URL is printed immediately ──
+    # ── Start ngrok BEFORE uvicorn ──
     tunnel_url = setup_ngrok_tunnel()
     if tunnel_url:
         print(f"\n{'='*60}")
@@ -429,14 +427,22 @@ def run_server():
         print(f"  Set VITE_API_URL = {tunnel_url}")
         print(f"{'='*60}\n")
 
-    # Run uvicorn in a thread to avoid blocking Colab
-    server_thread = threading.Thread(
-        target=lambda: uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info"),
-        daemon=True
-    )
-    server_thread.start()
-    print("✅ Server started in background thread")
-    return tunnel_url
+    # Run uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
 
 if __name__ == "__main__":
-    run_server()
+    # Check if running in Jupyter/Colab
+    try:
+        from IPython import get_ipython
+        in_jupyter = get_ipython() is not None
+    except:
+        in_jupyter = False
+
+    if in_jupyter:
+        # Colab/Jupyter: run in background thread
+        server_thread = threading.Thread(target=run_server_thread, daemon=True)
+        server_thread.start()
+        print("✅ Server started in background thread")
+    else:
+        # Direct script: run normally
+        run_server_thread()
