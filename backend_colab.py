@@ -22,7 +22,7 @@ import threading
 import numpy as np
 import torch
 import nibabel as nib
-from scipy.ndimage import zoom          # import at top — threading can't re-import C extensions
+# scipy NOT imported — pure numpy resize avoids C-extension re-import issues in Colab
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -201,6 +201,19 @@ except Exception as e:
 # Preprocessing
 # ============================================================================
 
+def resize_volume_nn(vol4d, target):
+    """
+    Pure-numpy nearest-neighbour 3-D resize for a (C, Z, Y, X) float32 array.
+    Replaces scipy.ndimage.zoom — no C extensions, safe to call from threads.
+    """
+    _, sz, sy, sx = vol4d.shape
+    tz, ty, tx = target
+    iz = np.round(np.linspace(0, sz - 1, tz)).astype(np.int32)
+    iy = np.round(np.linspace(0, sy - 1, ty)).astype(np.int32)
+    ix = np.round(np.linspace(0, sx - 1, tx)).astype(np.int32)
+    return vol4d[:, iz[:, None, None], iy[None, :, None], ix[None, None, :]]
+
+
 def normalize_intensity(volume, lower_percentile=0.5, upper_percentile=99.5):
     p_lower = np.percentile(volume, lower_percentile)
     p_upper = np.percentile(volume, upper_percentile)
@@ -229,10 +242,9 @@ def preprocess_nifti(nifti_data):
     # Normalize each channel
     channels = np.stack([normalize_intensity(channels[i]) for i in range(NUM_CHANNELS)], axis=0)
 
-    # Resize to 128³ if needed
+    # Resize to 128³ if needed — pure numpy, no scipy required
     if channels.shape[1:] != MODEL_INPUT_SIZE:
-        zoom_factors = [1.0] + [MODEL_INPUT_SIZE[i] / channels.shape[i + 1] for i in range(3)]
-        channels = zoom(channels, zoom_factors, order=0).astype(np.float32)  # order=0 = nearest, 5x faster
+        channels = resize_volume_nn(channels, MODEL_INPUT_SIZE).astype(np.float32)
 
     tensor = torch.from_numpy(channels).float().unsqueeze(0)  # (1, 4, 128, 128, 128)
     return tensor.to(DEVICE)
