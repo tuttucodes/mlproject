@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import nibabel as nib
 # scipy NOT imported — pure numpy resize avoids C-extension re-import issues in Colab
+from typing import Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -263,38 +264,78 @@ async def health():
     })
 
 
-def _run_inference_job(job_id: str, file_bytes: bytes, fname: str):
-    """Runs in a background thread. Updates JOBS[job_id] when done."""
+def _load_nifti_bytes(file_bytes: bytes, fname: str) -> np.ndarray:
+    """Write bytes to temp file, load with nibabel, return float32 array."""
+    suffix = ".nii.gz" if fname.endswith(".nii.gz") else ".nii"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+    try:
+        return nib.load(tmp_path).get_fdata(dtype=np.float32)
+    finally:
+        os.unlink(tmp_path)
+
+
+def _run_inference_job(job_id: str, modality_files: dict):
+    """
+    Runs in a background thread.
+    modality_files: dict of {name: (bytes, filename)} — keys: t1, t1ce, t2, flair (or 'file')
+    """
     try:
         JOBS[job_id]["status"] = "running"
 
-        suffix = ".nii.gz" if fname.endswith(".nii.gz") else ".nii"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
+        # ── Build 4-channel input in BraTS order: T1, T1CE, T2, FLAIR ──
+        ORDER = ["t1", "t1ce", "t2", "flair"]
+        loaded = {}
+        for key, (fb, fn) in modality_files.items():
+            loaded[key] = normalize_intensity(_load_nifti_bytes(fb, fn))
 
-        try:
-            nifti_img  = nib.load(tmp_path)
-            nifti_data = nifti_img.get_fdata(dtype=np.float32)
-        finally:
-            os.unlink(tmp_path)
+        if len(loaded) >= 2:
+            # Use available modalities in correct order; duplicate missing ones
+            ch_list = []
+            available = list(loaded.values())
+            for mod in ORDER:
+                ch_list.append(loaded[mod] if mod in loaded else available[0])
+            channels = np.stack(ch_list, axis=0)          # (4, Z, Y, X)
+        else:
+            # Single file — replicate to 4 channels
+            arr = list(loaded.values())[0]
+            channels = np.stack([arr] * NUM_CHANNELS, axis=0)
 
-        tensor = preprocess_nifti(nifti_data)
+        # Resize to 128³ if needed
+        if channels.shape[1:] != MODEL_INPUT_SIZE:
+            channels = resize_volume_nn(channels, MODEL_INPUT_SIZE).astype(np.float32)
+
+        tensor = torch.from_numpy(channels).float().unsqueeze(0).to(DEVICE)
 
         with torch.no_grad():
-            output = model(tensor)
+            output = model(tensor)   # [1, 3, 128, 128, 128]
 
-        seg = torch.argmax(output, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+        # ── Correct BraTS post-processing: sigmoid threshold, NOT argmax ──
+        # Model outputs 3 independent binary logits: TC (ch0), WT (ch1), ET (ch2)
+        probs = torch.sigmoid(output[0])               # [3, 128, 128, 128]
+        tc = (probs[0] > 0.5).cpu().numpy()            # Tumor Core
+        wt = (probs[1] > 0.5).cpu().numpy()            # Whole Tumor
+        et = (probs[2] > 0.5).cpu().numpy()            # Enhancing Tumor
+
+        seg = np.zeros(tc.shape, dtype=np.uint8)
+        seg[wt] = 2   # Edema (whole tumor region)
+        seg[tc] = 1   # Necrotic/tumor core (overrides edema)
+        seg[et] = 3   # Enhancing tumor (highest priority)
+
         seg_b64 = base64.b64encode(seg.tobytes()).decode("utf-8")
+        ncr = int((seg == 1).sum())
+        ed  = int((seg == 2).sum())
+        enh = int((seg == 3).sum())
+        print(f"[job {job_id}] done — NCR:{ncr} ED:{ed} ET:{enh}")
 
         JOBS[job_id] = {
-            "status":      "done",
+            "status":       "done",
             "segmentation": seg_b64,
             "shape":        list(seg.shape),
             "classes":      int(NUM_CLASSES),
             "device_used":  str(DEVICE),
         }
-        print(f"[job {job_id}] done — shape {seg.shape}")
 
     except Exception as e:
         import traceback
@@ -303,25 +344,36 @@ def _run_inference_job(job_id: str, file_bytes: bytes, fname: str):
 
 
 @app.post("/segment")
-async def segment(file: UploadFile = File(...)):
+async def segment(
+    file:  Optional[UploadFile] = File(None),   # single-file fallback
+    t1:    Optional[UploadFile] = File(None),
+    t1ce:  Optional[UploadFile] = File(None),
+    t2:    Optional[UploadFile] = File(None),
+    flair: Optional[UploadFile] = File(None),
+):
     """
-    Starts segmentation job. Returns job_id immediately (avoids ngrok 30s timeout).
-    Poll GET /segment/{job_id} for the result.
+    Accepts up to 4 BraTS modalities (t1, t1ce, t2, flair) or a single 'file'.
+    Returns job_id immediately; poll GET /segment/{job_id} for result.
     """
     if not model_loaded:
         raise HTTPException(status_code=503, detail="Model not loaded.")
-    if not (file.filename.endswith(".nii") or file.filename.endswith(".nii.gz")):
-        raise HTTPException(status_code=400, detail="File must be .nii or .nii.gz")
 
-    file_bytes = await file.read()
-    fname      = file.filename or "upload.nii"
-    job_id     = uuid.uuid4().hex[:10]
+    modality_files = {}
+    for name, uf in [("t1", t1), ("t1ce", t1ce), ("t2", t2), ("flair", flair), ("file", file)]:
+        if uf is not None:
+            fb = await uf.read()
+            modality_files[name] = (fb, uf.filename or f"{name}.nii")
 
+    if not modality_files:
+        raise HTTPException(status_code=400, detail="No NIfTI file uploaded.")
+
+    job_id = uuid.uuid4().hex[:10]
     JOBS[job_id] = {"status": "queued"}
-    thread = threading.Thread(target=_run_inference_job, args=(job_id, file_bytes, fname), daemon=True)
-    thread.start()
+    mods_str = ", ".join(modality_files.keys())
+    print(f"[job {job_id}] queued — modalities: {mods_str}")
 
-    print(f"[job {job_id}] queued — file={fname} size={len(file_bytes)//1024}KB")
+    thread = threading.Thread(target=_run_inference_job, args=(job_id, modality_files), daemon=True)
+    thread.start()
     return JSONResponse({"job_id": job_id, "status": "queued"})
 
 

@@ -776,7 +776,13 @@ export default function BrainTumorDashboard() {
       addLog("Uploading MRI to backend...");
       const t0 = performance.now();
       const fd = new FormData();
-      fd.append("file", file);
+      // Send all available modalities so backend builds proper 4-channel input
+      let sent = 0;
+      for (const [mod, f] of Object.entries(files)) {
+        fd.append(mod, f);
+        sent++;
+      }
+      addLog(`Sending ${sent} modality file(s): ${Object.keys(files).join(", ")}`);
 
       // POST returns instantly with a job_id (avoids ngrok 30s timeout)
       const startRes = await fetch(`${url}/segment`, {
@@ -817,12 +823,13 @@ export default function BrainTumorDashboard() {
 
       setSegData({ data: segArr, shape: json.shape });
 
-      // Compute real volume stats from actual segmentation mask
+      // Compute real volume stats — classes: 1=necrotic, 2=edema, 3=enhancing
       let c1 = 0, c2 = 0, c3 = 0;
       for (let i = 0; i < segArr.length; i++) {
-        if (segArr[i] === 1) c1++;
-        else if (segArr[i] === 2) c2++;
-        else if (segArr[i] === 3) c3++;
+        const v = segArr[i];
+        if (v === 1) c1++;       // necrotic/tumor core
+        else if (v === 2) c2++;  // edema/whole tumor
+        else if (v === 3) c3++;  // enhancing tumor
       }
       const total = c1 + c2 + c3;
       addLog(`Necrotic: ${c1} vox | Edema: ${c2} vox | Enhancing: ${c3} vox`);
