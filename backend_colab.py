@@ -413,7 +413,10 @@ def setup_ngrok_tunnel():
 # Entry Point
 # ============================================================================
 
-if __name__ == "__main__":
+def run_server():
+    """Run uvicorn server in a background thread (for Colab compatibility)."""
+    import sys
+
     print(f"Device : {DEVICE}")
     print(f"Model  : {'loaded' if model_loaded else 'FAILED'}")
 
@@ -426,4 +429,14 @@ if __name__ == "__main__":
         print(f"  Set VITE_API_URL = {tunnel_url}")
         print(f"{'='*60}\n")
 
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    # Run uvicorn in a thread to avoid blocking Colab
+    server_thread = threading.Thread(
+        target=lambda: uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info"),
+        daemon=True
+    )
+    server_thread.start()
+    print("✅ Server started in background thread")
+    return tunnel_url
+
+if __name__ == "__main__":
+    run_server()
