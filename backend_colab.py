@@ -31,6 +31,10 @@ from monai.networks.nets import SegResNet
 import uvicorn
 from pyngrok import ngrok
 
+# ── CRITICAL: Patch event loop for Jupyter/Colab BEFORE any asyncio calls ──
+import nest_asyncio
+nest_asyncio.apply()
+
 # In-memory job store  {job_id: {"status": "queued"|"running"|"done"|"error", ...}}
 JOBS: dict = {}
 
@@ -422,6 +426,4 @@ if __name__ == "__main__":
         print(f"  Set VITE_API_URL = {tunnel_url}")
         print(f"{'='*60}\n")
 
-    import nest_asyncio
-    nest_asyncio.apply()
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
