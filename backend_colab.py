@@ -86,9 +86,10 @@ def load_model():
             print("✅ Bundle downloaded successfully!")
 
         # SegResNet config MUST match the bundle's trained architecture
+        # init_filters=16 — confirmed from checkpoint weight shapes
         model = SegResNet(
             spatial_dims=3,
-            init_filters=32,        # bundle uses 32, not 8
+            init_filters=16,
             in_channels=4,
             out_channels=3,
             blocks_down=[1, 2, 2, 4],
@@ -144,7 +145,7 @@ def load_model():
 
         model = SegResNet(
             spatial_dims=3,
-            init_filters=32,
+            init_filters=16,
             in_channels=4,
             out_channels=3,
             blocks_down=[1, 2, 2, 4],

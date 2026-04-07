@@ -751,9 +751,15 @@ export default function BrainTumorDashboard() {
     const url = (backendUrl || API_BASE).replace(/\/$/, "");
     addLog(`Connecting to backend: ${url}`);
 
+    // ngrok free tier requires this header to bypass the browser warning page
+    const NGROK_HEADERS = { "ngrok-skip-browser-warning": "true" };
+
     let backendOk = false;
     try {
-      const h = await fetch(`${url}/health`, { signal: AbortSignal.timeout(8000) });
+      const h = await fetch(`${url}/health`, {
+        signal: AbortSignal.timeout(8000),
+        headers: NGROK_HEADERS,
+      });
       const hj = await h.json();
       backendOk = h.ok;
       addLog(`Backend: ${hj.status} on ${hj.device} — model loaded: ${hj.model_loaded}`);
@@ -762,7 +768,7 @@ export default function BrainTumorDashboard() {
       addLog("  → Is your Colab cell still running?");
       addLog("  → Is the ngrok URL in the header correct?");
       setIsProcessing(false);
-      return;  // No fallback to fake data — show real error
+      return;
     }
 
     // ── Step 3: Send to /segment, decode real results ──
@@ -772,7 +778,11 @@ export default function BrainTumorDashboard() {
       const fd = new FormData();
       fd.append("file", file);
 
-      const res = await fetch(`${url}/segment`, { method: "POST", body: fd });
+      const res = await fetch(`${url}/segment`, {
+        method: "POST",
+        body: fd,
+        headers: NGROK_HEADERS,
+      });
       if (!res.ok) {
         const txt = await res.text();
         throw new Error(`HTTP ${res.status}: ${txt}`);
@@ -874,7 +884,10 @@ export default function BrainTumorDashboard() {
               onChange={(e) => setBackendUrl(e.target.value)}
               onBlur={async () => {
                 try {
-                  const r = await fetch(`${backendUrl}/health`, { signal: AbortSignal.timeout(2000) });
+                  const r = await fetch(`${backendUrl}/health`, {
+                    signal: AbortSignal.timeout(4000),
+                    headers: { "ngrok-skip-browser-warning": "true" },
+                  });
                   setBackendStatus(r.ok ? "ok" : "down");
                 } catch { setBackendStatus("down"); }
               }}
