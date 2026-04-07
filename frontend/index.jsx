@@ -233,7 +233,9 @@ function SliceViewer({ volumeData, segData, sliceAxis, sliceIndex, onSliceChange
         imgData.data[pixel + 3] = 255;
 
         // Segmentation overlay — mapped to seg space independently
-        if (showOverlay && segData) {
+        // Brain mask: only draw overlay where actual brain tissue exists (val > 0.06)
+        // This prevents the overlay from appearing in the black background regions
+        if (showOverlay && segData && val > 0.06) {
           const sIdx = Math.min(Math.round(sliceIndex * sd[0] / vd[0]), sd[0] - 1);
           const ssx  = Math.min(Math.floor(px * sd[2] / size), sd[2] - 1);
           const ssy  = Math.min(Math.floor(py * sd[1] / size), sd[1] - 1);

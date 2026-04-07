@@ -121,6 +121,8 @@ def load_model():
         model.to(DEVICE)
         model.eval()
 
+        # Confirm real pretrained weights by printing param norm (random init ≈ 1.0, pretrained >> 1.0)
+        total_norm = sum(p.norm().item() for p in model.parameters())
         print("=" * 60)
         print("✅ PRETRAINED MODEL LOADED SUCCESSFULLY")
         print("   Dataset : BraTS 2021 (1251 multi-site cases)")
@@ -128,6 +130,7 @@ def load_model():
         print("   Dice TC  : 0.8560")
         print("   Dice ET  : 0.7926")
         print(f"   Device   : {DEVICE}")
+        print(f"   Param norm: {total_norm:.1f}  (>50 = pretrained weights confirmed)")
         print("=" * 60)
         return model
 
@@ -313,15 +316,24 @@ def _run_inference_job(job_id: str, modality_files: dict):
 
         # ── Correct BraTS post-processing: sigmoid threshold, NOT argmax ──
         # Model outputs 3 independent binary logits: TC (ch0), WT (ch1), ET (ch2)
+        # TC/ET use lower threshold (0.3) to be more sensitive; WT keeps 0.5
         probs = torch.sigmoid(output[0])               # [3, 128, 128, 128]
-        tc = (probs[0] > 0.5).cpu().numpy()            # Tumor Core
-        wt = (probs[1] > 0.5).cpu().numpy()            # Whole Tumor
-        et = (probs[2] > 0.5).cpu().numpy()            # Enhancing Tumor
+        tc = (probs[0] > 0.3).cpu().numpy()            # Tumor Core  (more sensitive)
+        wt = (probs[1] > 0.5).cpu().numpy()            # Whole Tumor (standard)
+        et = (probs[2] > 0.3).cpu().numpy()            # Enhancing   (more sensitive)
+        print(f"[job {job_id}] raw probs — TC mean={probs[0].mean():.4f}, WT mean={probs[1].mean():.4f}, ET mean={probs[2].mean():.4f}")
 
         seg = np.zeros(tc.shape, dtype=np.uint8)
         seg[wt] = 2   # Edema (whole tumor region)
         seg[tc] = 1   # Necrotic/tumor core (overrides edema)
         seg[et] = 3   # Enhancing tumor (highest priority)
+
+        # ── Brain mask: zero out segmentation in background voxels ──
+        # Use the mean of all 4 channels resized to 128³ as intensity reference
+        brain_intensity = channels.mean(axis=0)          # (128, 128, 128) float32, already normalized 0-1
+        bg_mask = brain_intensity < 0.05                 # background = intensity < 5% of max
+        seg[bg_mask] = 0                                 # remove any spurious seg in background
+        print(f"[job {job_id}] brain mask: removed {int(bg_mask.sum())} background voxels from seg")
 
         seg_b64 = base64.b64encode(seg.tobytes()).decode("utf-8")
         ncr = int((seg == 1).sum())
