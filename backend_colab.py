@@ -16,6 +16,8 @@ import io
 import os
 import base64
 import tempfile
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 import nibabel as nib
@@ -25,6 +27,9 @@ from fastapi.responses import JSONResponse
 from monai.networks.nets import SegResNet
 import uvicorn
 from pyngrok import ngrok
+
+# Thread pool so CPU inference doesn't block the asyncio event loop
+_executor = ThreadPoolExecutor(max_workers=1)
 
 # ============================================================================
 # Configuration
@@ -50,7 +55,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,   # must be False when allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -259,22 +264,35 @@ async def segment(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="File must be .nii or .nii.gz")
 
     try:
-        # Write to temp file (nibabel requires a real file path for compressed NII)
-        suffix = ".nii.gz" if file.filename.endswith(".nii.gz") else ".nii"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(await file.read())
-            tmp_path = tmp.name
+        # Read file bytes in async context
+        file_bytes = await file.read()
+        fname = file.filename or "upload.nii"
 
-        nifti_img = nib.load(tmp_path)
-        nifti_data = nifti_img.get_fdata(dtype=np.float32)
-        os.unlink(tmp_path)
+        # Run all CPU-heavy work in a thread so we don't block the event loop
+        def run_inference():
+            # Write to temp file (nibabel needs a real path for .nii.gz)
+            suffix = ".nii.gz" if fname.endswith(".nii.gz") else ".nii"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
 
-        input_tensor = preprocess_nifti(nifti_data)
+            try:
+                nifti_img  = nib.load(tmp_path)
+                nifti_data = nifti_img.get_fdata(dtype=np.float32)
+            finally:
+                os.unlink(tmp_path)
 
-        with torch.no_grad():
-            output = model(input_tensor)
+            tensor = preprocess_nifti(nifti_data)
 
-        segmentation = torch.argmax(output, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+            with torch.no_grad():
+                output = model(tensor)
+
+            seg = torch.argmax(output, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+            return seg
+
+        loop = asyncio.get_event_loop()
+        segmentation = await loop.run_in_executor(_executor, run_inference)
+
         seg_b64 = base64.b64encode(segmentation.tobytes()).decode("utf-8")
 
         return JSONResponse({
@@ -287,6 +305,8 @@ async def segment(file: UploadFile = File(...)):
     except nib.filebasedimage.ImageFileError as e:
         raise HTTPException(status_code=400, detail=f"Invalid NIFTI file: {e}")
     except Exception as e:
+        import traceback
+        print(f"Segment error:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Segmentation failed: {e}")
 
 # ============================================================================
