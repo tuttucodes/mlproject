@@ -427,8 +427,18 @@ def run_server_thread():
         print(f"  Set VITE_API_URL = {tunnel_url}")
         print(f"{'='*60}\n")
 
-    # Run uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    # ── Use uvicorn Config + Server instead of uvicorn.run() ──
+    # This avoids uvicorn's internal asyncio.run() call which conflicts with Jupyter
+    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
+    server = uvicorn.Server(config)
+
+    # Create fresh event loop in this background thread (isolated from Jupyter's loop)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(server.serve())
+    finally:
+        loop.close()
 
 if __name__ == "__main__":
     # Check if running in Jupyter/Colab
