@@ -316,6 +316,16 @@ def setup_ngrok_tunnel():
 if __name__ == "__main__":
     print(f"Device : {DEVICE}")
     print(f"Model  : {'loaded' if model_loaded else 'FAILED'}")
+
+    # ── Start ngrok BEFORE uvicorn so the URL is printed immediately ──
+    tunnel_url = setup_ngrok_tunnel()
+    if tunnel_url:
+        print(f"\n{'='*60}")
+        print(f"  YOUR NGROK URL (copy this into Vercel):")
+        print(f"  {tunnel_url}")
+        print(f"  Set VITE_API_URL = {tunnel_url}")
+        print(f"{'='*60}\n")
+
     import nest_asyncio
     nest_asyncio.apply()
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
