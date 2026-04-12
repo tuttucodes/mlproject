@@ -80,10 +80,7 @@ The training notebook includes **synthetic data generation** so you can run the 
 ```
 ml-brain-tumor/
 ├── backend/
-│   ├── app/
-│   │   ├── main.py                 # FastAPI app with 9 endpoints
-│   │   ├── api/
-│   │   │   ├── segmentation.py     # 3D U-Net inference + post-processing
+│   ├── app/       
 │   │   │   ├── grading.py          # Feature extraction → WHO grade
 │   │   │   ├── uncertainty.py      # MC-Dropout uncertainty
 │   │   │   ├── comparison.py       # Dice/Jaccard/Hausdorff metrics
@@ -178,3 +175,4 @@ Full interactive docs at `http://localhost:8000/docs` (Swagger UI).
 **License**: MIT  
 **Authors**: Rahul & Krishnaa  
 **Advisor**: Dr. Valarmathi, VIT Chennai
+# ML-PROJECT
